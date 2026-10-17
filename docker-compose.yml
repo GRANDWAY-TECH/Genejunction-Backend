@@ -1,0 +1,210 @@
+# Local stack: `docker compose up --build`, then the API gateway is on http://localhost:8080
+# and each service's Swagger UI is on http://localhost:81NN/docs (ports listed below).
+
+x-service: &service
+  build: &build
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    mongo: { condition: service_healthy }
+    redpanda: { condition: service_healthy }
+  environment: &env
+    ENV: dev
+    LOG_LEVEL: INFO
+    REDIS_URL: redis://redis:6379/0
+    KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    JWKS_URL: http://identity:8000/.well-known/jwks.json
+    INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+    TENANT_SERVICE_URL: http://tenant:8000
+    S3_ENDPOINT_URL: http://s3:9090
+    S3_PUBLIC_ENDPOINT_URL: http://localhost:9000
+    S3_BUCKET: genejunction-docs
+    AWS_ACCESS_KEY_ID: dev
+    AWS_SECRET_ACCESS_KEY: dev
+
+services:
+  # ------------------------------------------------------------ data & messaging
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_connections=500", "-c", "shared_buffers=256MB"]
+    environment:
+      POSTGRES_USER: gj
+      POSTGRES_PASSWORD: gj
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gj"]
+      interval: 3s
+      retries: 30
+
+  mongo:
+    image: mongo:7.0
+    volumes: [mongodata:/data/db]
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 30
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 5s
+      retries: 30
+
+  topics:
+    image: redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        for t in identity tenant partner catalog order payment billing lab wholesale consult legacy; do
+          rpk topic create gj.$$t gj.$$t.dlq -p 6 -X brokers=redpanda:9092 || true;
+        done
+    restart: "no"
+
+  s3:
+    # S3-compatible store for local dev (real S3 in production).
+    image: adobe/s3mock:3.11.0
+    environment:
+      initialBuckets: genejunction-docs
+    ports: ["9000:9090"]
+
+  # ------------------------------------------------------------ gateway
+  gateway:
+    image: nginx:1.27-alpine
+    volumes: ["./gateway/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["8080:8080"]
+    depends_on: [identity, tenant, partner, catalog, order, payment, billing, pharmacy, lab, wholesale, notification, legacy-bridge]
+
+  # ------------------------------------------------------------ services
+  identity:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: identity } }
+    ports: ["8101:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_identity
+      OTP_DEBUG_RETURN: "true"
+      BOOTSTRAP_ADMIN_EMAIL: admin@genejunction.com
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-Admin12345!}
+
+  tenant:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: tenant } }
+    ports: ["8102:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_tenant
+
+  partner:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: partner } }
+    ports: ["8103:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_partner
+
+  catalog:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: catalog } }
+    ports: ["8104:8000"]
+    environment:
+      <<: *env
+      MONGO_URL: mongodb://mongo:27017
+
+  order:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: order } }
+    ports: ["8105:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_order
+
+  payment:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: payment } }
+    ports: ["8106:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_payment
+      ENABLE_MOCK_GATEWAY: "true"
+      PUBLIC_BASE_URL: http://localhost:8080
+
+  billing:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: billing } }
+    ports: ["8107:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_billing
+
+  pharmacy:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: pharmacy } }
+    ports: ["8108:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_pharmacy
+
+  lab:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: lab } }
+    ports: ["8109:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_lab
+
+  wholesale:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: wholesale } }
+    ports: ["8110:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_wholesale
+
+  notification:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: notification } }
+    ports: ["8111:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_notification
+
+  legacy-bridge:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: legacy_bridge } }
+    ports: ["8112:8000"]
+    environment:
+      <<: *env
+      DATABASE_URL: postgresql+asyncpg://gj:gj@postgres:5432/gj_bridge
+      LEGACY_MODE: mock
+
+volumes:
+  pgdata:
+  mongodata:
