@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 
 from gj_common.auth import JWKSCache
 from gj_common.db import Database
-from gj_common.errors import install_error_handlers
+from gj_common.errors import ERROR_RESPONSES, install_error_handlers
 from gj_common.events import set_event_source
 from gj_common.events.kafka import EventBus, EventConsumer, Handler, OutboxRelay
 from gj_common.http import ServiceClient
@@ -138,7 +138,7 @@ def create_service_app(spec: ServiceSpec) -> FastAPI:
         return JSONResponse({"ready": ok, "checks": checks}, status_code=200 if ok else 503)
 
     for router in spec.routers:
-        app.include_router(router)
+        app.include_router(router, responses=ERROR_RESPONSES)
 
     Instrumentator(excluded_handlers=["/health", "/ready", "/metrics"]).instrument(app).expose(
         app, endpoint="/metrics", include_in_schema=False

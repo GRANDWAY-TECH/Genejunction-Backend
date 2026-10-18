@@ -69,3 +69,29 @@ class UserLookup(BaseModel):
 
 class LegacyLink(BaseModel):
     legacy_patient_id: str
+
+
+class TokenUser(BaseModel):
+    id: uuid.UUID
+    full_name: str | None
+    phone: str | None
+    email: str | None
+    roles: list[str] = Field(description="patient, partner_admin, partner_staff, tenant_admin, gj_admin, gj_ops, gj_finance")
+    partner_ids: list[uuid.UUID] = Field(description="Partners this user can act for")
+    tenant_id: uuid.UUID = Field(description="Brand the session belongs to")
+
+
+class TokenResponse(BaseModel):
+    access_token: str = Field(description="RS256 JWT, send as `Authorization: Bearer <token>`")
+    refresh_token: str = Field(description="Opaque; single use — every refresh returns a new one")
+    token_type: str = "Bearer"
+    expires_in: int = Field(description="Access-token lifetime in seconds", examples=[900])
+    user: TokenUser
+
+
+class Jwks(BaseModel):
+    keys: list[dict]
+
+
+class Granted(BaseModel):
+    granted: bool = True

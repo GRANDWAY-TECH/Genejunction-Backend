@@ -33,6 +33,17 @@ class NotificationOut(BaseModel):
     created_at: datetime
 
 
+class NotificationPage(BaseModel):
+    items: list[NotificationOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class Registered(BaseModel):
+    registered: bool = True
+
+
 class DeviceIn(BaseModel):
     platform: Literal["ios", "android", "web"]
     token: str = Field(max_length=512)
@@ -43,6 +54,13 @@ class CampaignIn(BaseModel):
     title: str = Field(max_length=200)
     message: str = Field(max_length=640)
     channels: list[Literal["push", "sms", "email"]] = ["push", "sms"]
+
+
+class CampaignPage(BaseModel):
+    items: list["CampaignOut"]
+    total: int
+    limit: int
+    offset: int
 
 
 class CampaignOut(BaseModel):
@@ -58,7 +76,10 @@ class CampaignOut(BaseModel):
     created_at: datetime
 
 
-@router.get("/me")
+CampaignPage.model_rebuild()
+
+
+@router.get("/me", response_model=NotificationPage)
 async def my_inbox(principal: CurrentUser, tenant: CurrentTenant, session: SessionDep, page: PageDep):
     stmt = select(Notification).where(Notification.recipient_type == "user", Notification.recipient_id == principal.user_id,
                                       Notification.tenant_id == tenant.id, Notification.channel == "in_app") \
@@ -66,7 +87,7 @@ async def my_inbox(principal: CurrentUser, tenant: CurrentTenant, session: Sessi
     return await paginate(session, stmt, page, NotificationOut.model_validate)
 
 
-@router.get("/business")
+@router.get("/business", response_model=NotificationPage)
 async def business_inbox(owner_type: Literal["partner", "tenant"], owner_id: uuid.UUID, principal: CurrentUser,
                          session: SessionDep, page: PageDep):
     if owner_type == "partner":
@@ -92,7 +113,7 @@ async def mark_read(notification_id: uuid.UUID, principal: CurrentUser, session:
     await session.commit()
 
 
-@router.post("/devices", status_code=201)
+@router.post("/devices", status_code=201, response_model=Registered)
 async def register_device(body: DeviceIn, principal: CurrentUser, tenant: CurrentTenant, session: SessionDep):
     existing = await session.scalar(select(DeviceToken).where(DeviceToken.token == body.token))
     if existing:
@@ -120,7 +141,7 @@ async def create_campaign(body: CampaignIn, principal: CurrentUser, request: Req
     return campaign
 
 
-@router.get("/campaigns")
+@router.get("/campaigns", response_model=CampaignPage)
 async def list_campaigns(tenant_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep):
     principal.ensure_tenant_admin(tenant_id)
     stmt = select(Campaign).where(Campaign.tenant_id == tenant_id).order_by(Campaign.created_at.desc())

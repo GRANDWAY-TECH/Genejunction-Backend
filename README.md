@@ -4,6 +4,9 @@ FastAPI microservices for the GeneJunction marketplace: one engine serving **B2C
 web), **B2B** (partner portals, business console) and **B2B2C** (white-label apps for clinic groups),
 integrated with the existing GeneJunction (PHP) system for consultations and the health folio.
 
+**API reference:** `http://localhost:8080/docs/` (Redoc, with a Swagger "try it" console) — built from
+[docs/api/openapi.json](docs/api/openapi.json); guide: [docs/API_GUIDE.md](docs/API_GUIDE.md).
+
 Architecture, data stores and scaling: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 Events: [docs/EVENTS.md](docs/EVENTS.md) · PHP integration contract: [docs/LEGACY_CONTRACT.md](docs/LEGACY_CONTRACT.md)
 
@@ -69,6 +72,7 @@ All paths are prefixed with `/api/v1`. Errors share one shape:
 # after changing models
 make migration s=order m="add delivery window"
 docker compose up -d --build order
+make docs        # after changing any endpoint: regenerate the API reference
 ```
 
 Each service is a standard FastAPI app (`app/main.py`) built with `gj_common.app_factory`; the same

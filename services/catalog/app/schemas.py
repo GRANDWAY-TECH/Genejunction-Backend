@@ -114,3 +114,100 @@ class PrescriptionMatchRequest(BaseModel):
 class FeatureRequest(BaseModel):
     partner_id: uuid.UUID
     until: datetime
+
+
+# ---------------------------------------------------------------- responses
+class ProductSnapshot(BaseModel):
+    """Product fields copied onto each offer so search needs no join."""
+
+    name: str
+    type: ProductType
+    category: str
+    brand: str | None = None
+    generic_name: str | None = None
+    requires_prescription: bool = False
+    sku: str
+    lab: LabTestInfo | None = None
+    image: str | None = None
+
+
+class ProductOut(BaseModel):
+    id: str
+    sku: str
+    type: ProductType
+    name: str
+    slug: str
+    generic_name: str | None = None
+    brand: str | None = None
+    category: str
+    description: str | None = None
+    requires_prescription: bool
+    attributes: dict = {}
+    lab: LabTestInfo | None = None
+    images: list[str] = []
+    status: str = Field(description="pending_review | active | inactive | rejected")
+    proposed_by_partner_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OfferOut(BaseModel):
+    id: str
+    product_id: str
+    partner_id: str
+    partner_name: str | None = None
+    partner_type: str | None = None
+    channel: Channel
+    price: Decimal = Field(examples=["38.00"])
+    mrp: Decimal | None = None
+    stock: int | None = Field(None, description="null = not stock-tracked (lab tests)")
+    min_order_qty: int = 1
+    wholesale_tiers: list[WholesaleTier] = []
+    active: bool
+    featured_until: datetime | None = None
+    product: ProductSnapshot
+    created_at: datetime
+    updated_at: datetime
+
+
+class PartnerOfferOut(OfferOut):
+    visibility: dict | None = Field(None, description="Where this offer is shown: marketplace and/or tenant ids")
+    awaiting_product_approval: bool | None = None
+
+
+class SearchHit(BaseModel):
+    product_id: str
+    product: ProductSnapshot
+    min_price: Decimal
+    offer_count: int
+    featured: bool
+    best_offer: OfferOut = Field(description="Featured first, then cheapest")
+
+
+class SearchPage(BaseModel):
+    items: list[SearchHit]
+    total: int
+    limit: int
+    offset: int
+
+
+class ProductDetail(ProductOut):
+    offers: list[OfferOut] = Field(description="Offers visible in the caller's app, cheapest first")
+
+
+class ProductPage(BaseModel):
+    items: list[ProductOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class OfferPage(BaseModel):
+    items: list[PartnerOfferOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class StockUpdated(BaseModel):
+    updated: int

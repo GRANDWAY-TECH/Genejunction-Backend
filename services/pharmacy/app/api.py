@@ -2,7 +2,7 @@ import json
 import uuid
 
 from fastapi import APIRouter, Header, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,17 @@ class FulfilmentOut(BaseModel):
     rejection_reason: str | None
 
 
+class FulfilmentDetail(FulfilmentOut):
+    prescription_document_url: str | None = Field(None, description="Short-lived link to an uploaded prescription")
+
+
+class FulfilmentPage(BaseModel):
+    items: list[FulfilmentOut]
+    total: int
+    limit: int
+    offset: int
+
+
 class Reason(BaseModel):
     reason: str
 
@@ -69,9 +80,11 @@ async def _move(request: Request, session: AsyncSession, f: Fulfilment, status: 
     return f
 
 
-@router.get("/{partner_id}/fulfilments")
+@router.get("/{partner_id}/fulfilments", response_model=FulfilmentPage)
 async def list_fulfilments(partner_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep,
                            status: str | None = None, channel: str | None = None):
+    """Pharmacy inbox: orders from the GeneJunction app and every white-label app (`channel` B2C / B2B2C).
+    Work them through accept → (verify-prescription) → pack → dispatch or ready-for-pickup → delivered."""
     principal.ensure_partner(partner_id)
     stmt = select(Fulfilment).where(Fulfilment.partner_id == partner_id).order_by(Fulfilment.created_at.desc())
     if status:
@@ -81,7 +94,7 @@ async def list_fulfilments(partner_id: uuid.UUID, principal: CurrentUser, sessio
     return await paginate(session, stmt, page, FulfilmentOut.model_validate)
 
 
-@router.get("/fulfilments/{fulfilment_id}")
+@router.get("/fulfilments/{fulfilment_id}", response_model=FulfilmentDetail)
 async def get_fulfilment(fulfilment_id: uuid.UUID, principal: CurrentUser, request: Request, session: SessionDep):
     f = await _load(session, principal, fulfilment_id)
     out = FulfilmentOut.model_validate(f).model_dump()

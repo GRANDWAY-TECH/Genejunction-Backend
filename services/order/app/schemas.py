@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from gj_common.contracts import PaymentRef
+
 
 class Address(BaseModel):
     recipient: str
@@ -153,3 +155,69 @@ class StatusChange(BaseModel):
     tracking: dict | None = None
     schedule: dict | None = None
     external_ref: str | None = None
+
+
+# ---------------------------------------------------------------- cart & checkout responses
+class QuoteLine(BaseModel):
+    """Live price and availability for a cart line (from the catalog)."""
+
+    offer_id: str
+    product_id: str
+    partner_id: str
+    partner_type: str | None
+    partner_name: str | None
+    product: dict = Field(description="Product snapshot: name, type, category, requires_prescription, sku, ...")
+    qty: int
+    unit_price: Decimal
+    mrp: Decimal | None = None
+    line_total: Decimal
+
+
+class CartItemView(BaseModel):
+    id: uuid.UUID
+    kind: Literal["product", "consultation"]
+    qty: int
+    source: Literal["manual", "prescription"]
+    prescription_id: uuid.UUID | None
+    offer_id: str | None = None
+    line: QuoteLine | None = Field(None, description="null when the item can no longer be bought (see `problems`)")
+    consultation: dict | None = Field(None, description="{doctor_id, slot_id} for consultation items")
+
+
+class CartProblem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    offer_id: str
+    problem: str = Field(description="unavailable | not_available_in_this_app | below_min_order_qty | insufficient_stock")
+
+
+class CartView(BaseModel):
+    id: uuid.UUID
+    items: list[CartItemView]
+    problems: list[CartProblem]
+    products_subtotal: Decimal = Field(description="Products only; delivery, collection and consult fees are added at checkout")
+
+
+class CheckoutResponse(BaseModel):
+    order: OrderOut
+    payment: PaymentRef | None = Field(description="Redirect the patient to `payment.checkout_url`")
+
+
+class HistoryEntry(BaseModel):
+    source: Literal["marketplace", "genejunction"] = Field(description="genejunction = ordered in the existing system")
+    id: uuid.UUID
+    number: str
+    status: str
+    total: Decimal
+    at: datetime
+    description: str
+
+
+class TimelineEntry(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    sub_order_id: uuid.UUID | None = Field(description="null = whole order")
+    from_status: str | None = Field(alias="from")
+    to: str
+    note: str | None
+    at: datetime

@@ -4,11 +4,32 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gj_common.logging import current_request_id, get_logger
 
 log = get_logger(__name__)
+
+
+class ErrorBody(BaseModel):
+    code: str = Field(description="Stable machine-readable code, e.g. `cart_invalid`, `insufficient_credits`",
+                      examples=["not_found"])
+    message: str = Field(description="Human-readable message, safe to show to users", examples=["Order not found"])
+    details: Any = Field(None, description="Extra context, e.g. validation errors or the cart problems list")
+
+
+class ErrorResponse(BaseModel):
+    """Every non-2xx response has this shape."""
+
+    error: ErrorBody
+    request_id: str | None = Field(None, description="Quote this to support; also in the `X-Request-ID` header")
+
+
+ERROR_RESPONSES: dict = {
+    "4XX": {"model": ErrorResponse, "description": "Client error — see `error.code`"},
+    "5XX": {"model": ErrorResponse, "description": "Server or upstream error"},
+}
 
 
 class AppError(Exception):

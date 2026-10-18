@@ -11,6 +11,9 @@ from app.schemas import (
     AddConsultation,
     AddItem,
     CancelRequest,
+    CartView,
+    CheckoutResponse,
+    HistoryEntry,
     CheckoutRequest,
     LegacyOrderImport,
     OrderOut,
@@ -18,6 +21,7 @@ from app.schemas import (
     PrescriptionOut,
     StatusChange,
     SubOrderOut,
+    TimelineEntry,
     UpdateQty,
 )
 from gj_common.auth import CurrentUser, InternalOnly, staff_only
@@ -56,14 +60,16 @@ async def _cart_view(request: Request, cart, tenant_id: uuid.UUID) -> dict:
     return {"id": cart.id, "items": items, "problems": problems, "products_subtotal": str(subtotal)}
 
 
-@cart_router.get("")
+@cart_router.get("", response_model=CartView)
 async def view_cart(principal: CurrentUser, tenant: CurrentTenant, request: Request, session: SessionDep):
+    """The patient's cart in this app, with live prices. Items that can no longer be bought are listed in
+    `problems` (out of stock, provider not in this app, ...) so the app can ask the patient to remove them."""
     cart = await domain.get_cart(session, principal.user_id, tenant.id)
     await session.commit()
     return await _cart_view(request, cart, tenant.id)
 
 
-@cart_router.post("/items", status_code=201)
+@cart_router.post("/items", status_code=201, response_model=CartView)
 async def add_item(body: AddItem, principal: CurrentUser, tenant: CurrentTenant, request: Request, session: SessionDep):
     # Validate the offer is sellable in this app before adding it.
     await request.app.state.catalog.post("/internal/catalog/quote", json={
@@ -78,9 +84,11 @@ async def add_item(body: AddItem, principal: CurrentUser, tenant: CurrentTenant,
     return await _cart_view(request, cart, tenant.id)
 
 
-@cart_router.post("/consultation", status_code=201)
+@cart_router.post("/consultation", status_code=201, response_model=CartView)
 async def add_consultation(body: AddConsultation, principal: CurrentUser, tenant: CurrentTenant, request: Request,
                            session: SessionDep):
+    """Add a video consultation (doctor + slot from `/consult/doctors/{id}/slots`). Paid together with the rest
+    of the cart; the booking is made in the existing system after payment. One consultation per checkout."""
     cart = await domain.get_cart(session, principal.user_id, tenant.id)
     if any(i.kind == "consultation" for i in cart.items):
         raise ValidationFailed("Only one consultation can be booked per checkout", code="one_consultation")
@@ -89,7 +97,7 @@ async def add_consultation(body: AddConsultation, principal: CurrentUser, tenant
     return await _cart_view(request, cart, tenant.id)
 
 
-@cart_router.patch("/items/{item_id}")
+@cart_router.patch("/items/{item_id}", response_model=CartView)
 async def update_item(item_id: uuid.UUID, body: UpdateQty, principal: CurrentUser, tenant: CurrentTenant,
                       request: Request, session: SessionDep):
     cart = await domain.get_cart(session, principal.user_id, tenant.id)
@@ -101,7 +109,7 @@ async def update_item(item_id: uuid.UUID, body: UpdateQty, principal: CurrentUse
     return await _cart_view(request, cart, tenant.id)
 
 
-@cart_router.delete("/items/{item_id}")
+@cart_router.delete("/items/{item_id}", response_model=CartView)
 async def remove_item(item_id: uuid.UUID, principal: CurrentUser, tenant: CurrentTenant, request: Request,
                       session: SessionDep):
     cart = await domain.get_cart(session, principal.user_id, tenant.id)
@@ -118,10 +126,21 @@ async def clear_cart(principal: CurrentUser, tenant: CurrentTenant, session: Ses
 
 
 # ---------------------------------------------------------------- orders (patient)
-@orders.post("/checkout", status_code=201)
+@orders.post("/checkout", status_code=201, response_model=CheckoutResponse)
 async def checkout(body: CheckoutRequest, principal: CurrentUser, tenant: CurrentTenant, request: Request,
                    session: SessionDep, idempotency_key: str = Header(..., alias="Idempotency-Key", max_length=100)):
-    """One checkout for medicines, lab tests and a consultation. Returns the payment to complete."""
+    """One checkout for everything in the cart: medicines, lab tests and a consultation.
+
+    The order is split into one sub-order per provider (pharmacy, lab, doctor). Stock is reserved and the
+    consult slot held for 30 minutes while the patient pays at `payment.checkout_url`.
+
+    * **Idempotency-Key** (required): any unique string per checkout attempt. Retrying with the same key
+      returns the same order instead of creating a second one.
+    * `delivery_address` is required for delivery and home sample collection.
+    * `lab_collection` is required when the cart has lab tests.
+    * Prescription medicines need a prescription from a GeneJunction consult (added to the cart
+      automatically) or an uploaded `prescription_document_key`.
+    * Fees: delivery RM 5 under RM 50, home sample collection RM 20."""
     result = await domain.checkout(request.app, session, principal, tenant, body, idempotency_key)
     return {"order": OrderOut.model_validate(result["order"]), "payment": result["payment"]}
 
@@ -136,7 +155,7 @@ async def my_orders(principal: CurrentUser, tenant: CurrentTenant, session: Sess
     return await paginate(session, stmt, page)
 
 
-@orders.get("/history")
+@orders.get("/history", response_model=list[HistoryEntry])
 async def full_history(principal: CurrentUser, session: SessionDep, limit: int = Query(50, le=200)):
     """Marketplace orders plus orders made in the existing GeneJunction system, newest first."""
     own = (await session.scalars(select(Order).where(Order.user_id == principal.user_id)
@@ -162,7 +181,7 @@ async def get_order(order_id: uuid.UUID, principal: CurrentUser, session: Sessio
     return await _own_order(session, principal, order_id)
 
 
-@orders.get("/{order_id}/timeline")
+@orders.get("/{order_id}/timeline", response_model=list[TimelineEntry])
 async def order_timeline(order_id: uuid.UUID, principal: CurrentUser, session: SessionDep):
     await _own_order(session, principal, order_id)
     rows = (await session.scalars(select(OrderStatusHistory).where(OrderStatusHistory.order_id == order_id)

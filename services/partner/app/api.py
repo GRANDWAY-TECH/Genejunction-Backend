@@ -16,9 +16,11 @@ from app.schemas import (
     PartnerOut,
     PartnerPatch,
     ReviewDecision,
+    ReviewEntry,
     StaffInvite,
 )
 from gj_common.auth import GJ_ADMIN, GJ_OPS, PARTNER_ADMIN, TENANT_ADMIN, CurrentUser, InternalOnly, require_roles, staff_only
+from gj_common.contracts import RoleGranted, UploadTicket
 from gj_common.db import SessionDep
 from gj_common.errors import Conflict, Forbidden, NotFound, ValidationFailed
 from gj_common.events import emit
@@ -130,9 +132,11 @@ async def set_bank_account(partner_id: uuid.UUID, body: BankAccount, principal: 
     return partner
 
 
-@router.post("/{partner_id}/documents", status_code=201)
+@router.post("/{partner_id}/documents", status_code=201, response_model=UploadTicket)
 async def create_document_upload(partner_id: uuid.UUID, body: DocumentUpload, principal: CurrentUser,
                                  request: Request, session: SessionDep):
+    """Get a one-time upload URL for a licence / registration document (PDF, JPEG or PNG), then
+    `PUT` the file to it. Documents are private and reviewed by GeneJunction ops."""
     principal.ensure_partner(partner_id)
     await _partner(session, partner_id)
     doc_id = uuid.uuid4()
@@ -142,7 +146,7 @@ async def create_document_upload(partner_id: uuid.UUID, body: DocumentUpload, pr
     session.add(doc)
     await session.commit()
     upload_url = request.app.state.storage.presign_upload(key, body.content_type)
-    return {"document_id": doc_id, "upload_url": upload_url, "method": "PUT", "headers": {"Content-Type": body.content_type}}
+    return UploadTicket(document_id=doc_id, upload_url=upload_url, headers={"Content-Type": body.content_type})
 
 
 @router.get("/{partner_id}/documents", response_model=list[DocumentOut])
@@ -214,13 +218,13 @@ async def suspend(partner_id: uuid.UUID, body: ReviewDecision, principal: Curren
     return partner
 
 
-@router.get("/{partner_id}/review-log", dependencies=[staff_only()])
+@router.get("/{partner_id}/review-log", response_model=list[ReviewEntry], dependencies=[staff_only()])
 async def review_log(partner_id: uuid.UUID, session: SessionDep):
     rows = (await session.scalars(select(ReviewLog).where(ReviewLog.partner_id == partner_id).order_by(ReviewLog.created_at))).all()
     return [{"action": r.action, "actor_id": r.actor_id, "note": r.note, "at": r.created_at} for r in rows]
 
 
-@router.post("/{partner_id}/staff", status_code=201)
+@router.post("/{partner_id}/staff", status_code=201, response_model=RoleGranted)
 async def invite_staff(partner_id: uuid.UUID, body: StaffInvite, principal: CurrentUser, request: Request, session: SessionDep):
     principal.ensure_partner_admin(partner_id)
     await _partner(session, partner_id)

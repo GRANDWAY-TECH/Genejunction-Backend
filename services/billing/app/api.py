@@ -23,6 +23,23 @@ from app.models import (
     SettlementEntry,
     TopUp,
 )
+from app.responses import (
+    CreditPackOut,
+    FeaturedResult,
+    InvoicePage,
+    InvoicePayment,
+    LedgerPage,
+    PayoutOut,
+    PayoutPage,
+    PlanOut,
+    RateCardOut,
+    RevenueReport,
+    SettlementList,
+    SettlementPage,
+    SubscriptionOut,
+    TopUpResponse,
+    WalletView,
+)
 from gj_common.auth import GJ_ADMIN, GJ_FINANCE, CurrentUser, InternalOnly, Principal, require_roles, staff_only
 from gj_common.db import SessionDep
 from gj_common.errors import Conflict, NotFound
@@ -144,21 +161,21 @@ class SubscriptionIn(BaseModel):
 
 
 # ---------------------------------------------------------------- catalogue of paid extras
-@router.get("/rate-card")
+@router.get("/rate-card", response_model=list[RateCardOut])
 async def rate_card(session: SessionDep):
     rows = (await session.scalars(select(RateCardItem).where(RateCardItem.active.is_(True)))).all()
     return [{"action_code": r.action_code, "name": r.name, "unit": r.unit, "credits_per_unit": r.credits_per_unit,
              "models": r.models, "charged_to": r.charged_to} for r in rows]
 
 
-@router.get("/credit-packs")
+@router.get("/credit-packs", response_model=list[CreditPackOut])
 async def credit_packs(session: SessionDep):
     rows = (await session.scalars(select(CreditPack).where(CreditPack.active.is_(True)).order_by(CreditPack.price))).all()
     return [{"code": p.code, "name": p.name, "price": p.price, "credits": p.credits, "bonus_credits": p.bonus_credits,
              "total_credits": p.credits + p.bonus_credits} for p in rows]
 
 
-@router.get("/plans")
+@router.get("/plans", response_model=list[PlanOut])
 async def plans(session: SessionDep):
     rows = (await session.scalars(select(Plan).where(Plan.active.is_(True)))).all()
     return [{"code": p.code, "name": p.name, "audience": p.audience, "monthly_fee": p.monthly_fee,
@@ -166,7 +183,7 @@ async def plans(session: SessionDep):
 
 
 # ---------------------------------------------------------------- wallets
-@router.get("/wallets/{owner_type}/{owner_id}")
+@router.get("/wallets/{owner_type}/{owner_id}", response_model=WalletView)
 async def wallet(owner_type: OwnerType, owner_id: uuid.UUID, principal: CurrentUser, session: SessionDep):
     ensure_owner(principal, owner_type, owner_id)
     w = await credits.get_wallet(session, owner_type, owner_id)
@@ -176,7 +193,7 @@ async def wallet(owner_type: OwnerType, owner_id: uuid.UUID, principal: CurrentU
     return {**WalletOut.model_validate(w).model_dump(), "low_balance_threshold": threshold, "grace_ends_at": grace_ends}
 
 
-@router.get("/wallets/{owner_type}/{owner_id}/ledger")
+@router.get("/wallets/{owner_type}/{owner_id}/ledger", response_model=LedgerPage)
 async def ledger(owner_type: OwnerType, owner_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep):
     ensure_owner(principal, owner_type, owner_id)
     w = await credits.get_wallet(session, owner_type, owner_id)
@@ -205,9 +222,11 @@ async def create_topup(payments, session: AsyncSession, w: CreditWallet, pack_co
             "credits": pack.credits + pack.bonus_credits, "payment": payment}
 
 
-@router.post("/wallets/{owner_type}/{owner_id}/topups", status_code=201)
+@router.post("/wallets/{owner_type}/{owner_id}/topups", status_code=201, response_model=TopUpResponse)
 async def topup(owner_type: OwnerType, owner_id: uuid.UUID, body: TopUpRequest, principal: CurrentUser,
                 request: Request, session: SessionDep):
+    """Buy a credit pack (see `/billing/credit-packs`). Pay at `payment.checkout_url`; credits (with bonus) are
+    added when payment succeeds and an SST invoice is issued. 1 credit = RM 1, valid 12 months."""
     ensure_owner(principal, owner_type, owner_id)
     w = await credits.get_wallet(session, owner_type, owner_id)
     result = await create_topup(request.app.state.payments, session, w, body.pack_code, body.method, body.return_url, principal.user_id)
@@ -215,7 +234,7 @@ async def topup(owner_type: OwnerType, owner_id: uuid.UUID, body: TopUpRequest, 
     return result
 
 
-@router.put("/wallets/{owner_type}/{owner_id}/auto-topup")
+@router.put("/wallets/{owner_type}/{owner_id}/auto-topup", response_model=WalletOut)
 async def auto_topup(owner_type: OwnerType, owner_id: uuid.UUID, body: AutoTopUp, principal: CurrentUser,
                      session: SessionDep):
     ensure_owner(principal, owner_type, owner_id)
@@ -227,7 +246,7 @@ async def auto_topup(owner_type: OwnerType, owner_id: uuid.UUID, body: AutoTopUp
     return WalletOut.model_validate(w)
 
 
-@router.post("/partners/{partner_id}/featured")
+@router.post("/partners/{partner_id}/featured", response_model=FeaturedResult)
 async def buy_featured(partner_id: uuid.UUID, body: FeatureRequest, principal: CurrentUser, request: Request,
                        session: SessionDep):
     """Featured listing in search: charged per week from the partner's credits."""
@@ -244,7 +263,7 @@ async def buy_featured(partner_id: uuid.UUID, body: FeatureRequest, principal: C
 
 
 # ---------------------------------------------------------------- settlements, payouts, invoices (business views)
-@router.get("/partners/{partner_id}/settlements")
+@router.get("/partners/{partner_id}/settlements", response_model=SettlementPage)
 async def partner_settlements(partner_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep,
                               status: str | None = None):
     principal.ensure_partner(partner_id)
@@ -271,7 +290,7 @@ def _payout(p: Payout) -> dict:
             "bank_reference": p.bank_reference, "bank": p.bank_snapshot}
 
 
-@router.get("/payees/{payee_type}/{payee_id}/payouts")
+@router.get("/payees/{payee_type}/{payee_id}/payouts", response_model=PayoutPage)
 async def payee_payouts(payee_type: OwnerType, payee_id: uuid.UUID, principal: CurrentUser, session: SessionDep,
                         page: PageDep):
     ensure_owner(principal, payee_type, payee_id)
@@ -279,7 +298,7 @@ async def payee_payouts(payee_type: OwnerType, payee_id: uuid.UUID, principal: C
     return await paginate(session, stmt, page, _payout)
 
 
-@router.get("/tenants/{tenant_id}/earnings")
+@router.get("/tenants/{tenant_id}/earnings", response_model=SettlementList)
 async def tenant_earnings(tenant_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep):
     """The clinic group's commission on orders in its white-label app."""
     principal.ensure_tenant_admin(tenant_id)
@@ -288,7 +307,7 @@ async def tenant_earnings(tenant_id: uuid.UUID, principal: CurrentUser, session:
     return await paginate(session, stmt, page, _entry)
 
 
-@router.get("/invoices")
+@router.get("/invoices", response_model=InvoicePage)
 async def invoices(customer_type: OwnerType, customer_id: uuid.UUID, principal: CurrentUser, session: SessionDep,
                    page: PageDep):
     ensure_owner(principal, customer_type, customer_id)
@@ -303,7 +322,7 @@ def _invoice(i: Invoice) -> dict:
             "issued_at": i.issued_at, "due_at": i.due_at, "paid_at": i.paid_at}
 
 
-@router.post("/invoices/{invoice_id}/pay", status_code=201)
+@router.post("/invoices/{invoice_id}/pay", status_code=201, response_model=InvoicePayment)
 async def pay_invoice(invoice_id: uuid.UUID, body: PayRequest, principal: CurrentUser, request: Request,
                       session: SessionDep):
     invoice = await session.get(Invoice, invoice_id)
@@ -345,7 +364,7 @@ async def deactivate_rule(rule_id: uuid.UUID, session: SessionDep):
     return rule
 
 
-@finance.put("/rate-overrides", status_code=200)
+@finance.put("/rate-overrides", status_code=200, response_model=RateOverrideIn)
 async def put_override(body: RateOverrideIn, session: SessionDep):
     if await session.get(RateCardItem, body.action_code) is None:
         raise NotFound("Unknown action")
@@ -358,7 +377,7 @@ async def put_override(body: RateOverrideIn, session: SessionDep):
     return body
 
 
-@finance.post("/wallets/{owner_type}/{owner_id}/adjust")
+@finance.post("/wallets/{owner_type}/{owner_id}/adjust", response_model=WalletOut)
 async def adjust(owner_type: OwnerType, owner_id: uuid.UUID, body: Adjustment, principal: CurrentUser, session: SessionDep):
     w = await credits.get_wallet(session, owner_type, owner_id, lock=True)
     ref = f"adjust:{uuid.uuid4()}"
@@ -373,7 +392,7 @@ async def adjust(owner_type: OwnerType, owner_id: uuid.UUID, body: Adjustment, p
     return WalletOut.model_validate(w)
 
 
-@finance.get("/payouts")
+@finance.get("/payouts", response_model=PayoutPage)
 async def list_payouts(session: SessionDep, page: PageDep, status: str | None = None):
     stmt = select(Payout).order_by(Payout.created_at.desc())
     if status:
@@ -381,14 +400,14 @@ async def list_payouts(session: SessionDep, page: PageDep, status: str | None = 
     return await paginate(session, stmt, page, _payout)
 
 
-@finance.post("/payouts/run")
+@finance.post("/payouts/run", response_model=list[PayoutOut])
 async def run_payouts(session: SessionDep):
     created = await settlement.build_payouts(session)
     await session.commit()
     return [_payout(p) for p in created]
 
 
-@finance.post("/payouts/{payout_id}/approve")
+@finance.post("/payouts/{payout_id}/approve", response_model=PayoutOut)
 async def approve_payout(payout_id: uuid.UUID, principal: CurrentUser, request: Request, session: SessionDep):
     payout = await session.get(Payout, payout_id, with_for_update=True)
     if payout is None:
@@ -405,7 +424,7 @@ async def approve_payout(payout_id: uuid.UUID, principal: CurrentUser, request: 
     return _payout(payout)
 
 
-@finance.post("/payouts/{payout_id}/mark-paid")
+@finance.post("/payouts/{payout_id}/mark-paid", response_model=PayoutOut)
 async def mark_paid(payout_id: uuid.UUID, body: MarkPaid, session: SessionDep):
     payout = await session.get(Payout, payout_id, with_for_update=True)
     if payout is None:
@@ -420,14 +439,14 @@ async def mark_paid(payout_id: uuid.UUID, body: MarkPaid, session: SessionDep):
     return _payout(payout)
 
 
-@finance.post("/subscriptions", status_code=201)
+@finance.post("/subscriptions", status_code=201, response_model=SubscriptionOut)
 async def create_subscription(body: SubscriptionIn, session: SessionDep):
     sub = await invoicing.start_subscription(session, body.subscriber_type, body.subscriber_id, body.plan_code)
     await session.commit()
     return {"id": sub.id, "plan_code": sub.plan_code, "current_period_end": sub.current_period_end}
 
 
-@router.get("/reports/revenue", dependencies=[staff_only()])
+@router.get("/reports/revenue", response_model=RevenueReport, dependencies=[staff_only()])
 async def revenue(session: SessionDep, start: datetime, end: datetime):
     """GJ earnings by stream: commission / transaction fees, credits consumed, subscriptions."""
     by_channel = (await session.execute(

@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Header, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +23,46 @@ consult = APIRouter(prefix="/api/v1/consult", tags=["consultations (existing sys
 folio = APIRouter(prefix="/api/v1/folio", tags=["health folio (existing system)"])
 webhooks = APIRouter(prefix="/api/v1/legacy/webhooks", tags=["legacy webhooks"], include_in_schema=False)
 internal = APIRouter(prefix="/internal/consult", tags=["internal"], dependencies=[InternalOnly])
+
+
+class DoctorOut(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(examples=["doc-1001"])
+    name: str
+    specialty: str
+    clinic: str | None = None
+    fee: Decimal = Field(description="Consultation fee (RM)")
+
+
+class SlotOut(BaseModel):
+    slot_id: str = Field(description="Pass to `POST /cart/consultation`")
+    start: datetime
+    end: datetime
+
+
+class ConsultBookingOut(BaseModel):
+    id: uuid.UUID
+    doctor_id: str
+    doctor_name: str
+    slot_start: datetime
+    status: str = Field(description="booked | completed | no_show | cancelled")
+    video_url: str | None = Field(description="Join link for the video consultation")
+    sub_order_id: uuid.UUID
+    legacy_booking_id: str
+
+
+class FolioRecord(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    type: str = Field(description="e.g. lab_report, prescription, consultation_note")
+    title: str | None = None
+    date: str | None = None
+
+
+class Accepted(BaseModel):
+    accepted: bool = True
 
 
 class HoldRequest(BaseModel):
@@ -71,7 +111,7 @@ async def taken_slots(session: AsyncSession, doctor_id: str) -> set[str]:
 
 
 # ---------------------------------------------------------------- doctors & slots
-@consult.get("/doctors")
+@consult.get("/doctors", response_model=list[DoctorOut])
 async def list_doctors(request: Request, tenant: CurrentTenant, specialty: str | None = None, q: str | None = None):
     """Doctors from the existing system, filtered to the caller's network (all listed doctors on the marketplace)."""
     mode, ids = await doctor_filter(request, tenant)
@@ -79,12 +119,12 @@ async def list_doctors(request: Request, tenant: CurrentTenant, specialty: str |
     return [d for d in docs if _visible(mode, ids, d["id"])]
 
 
-@consult.get("/doctors/{doctor_id}")
+@consult.get("/doctors/{doctor_id}", response_model=DoctorOut)
 async def get_doctor(doctor_id: str, request: Request, tenant: CurrentTenant):
     return await _visible_doctor(request, tenant, doctor_id)
 
 
-@consult.get("/doctors/{doctor_id}/slots")
+@consult.get("/doctors/{doctor_id}/slots", response_model=list[SlotOut])
 async def slots(doctor_id: str, request: Request, tenant: CurrentTenant, session: SessionDep,
                 day: date | None = None):
     await _visible_doctor(request, tenant, doctor_id)
@@ -93,7 +133,7 @@ async def slots(doctor_id: str, request: Request, tenant: CurrentTenant, session
     return [s for s in await request.app.state.legacy.get_slots(doctor_id, day) if s["slot_id"] not in taken]
 
 
-@consult.get("/bookings")
+@consult.get("/bookings", response_model=list[ConsultBookingOut])
 async def my_bookings(principal: CurrentUser, session: SessionDep):
     rows = (await session.scalars(select(ConsultBooking).where(ConsultBooking.user_id == principal.user_id)
                                   .order_by(ConsultBooking.slot_start.desc()).limit(100))).all()
@@ -110,7 +150,7 @@ async def _patient_id(session: AsyncSession, user_id: uuid.UUID) -> str:
     return link.legacy_patient_id
 
 
-@folio.get("")
+@folio.get("", response_model=list[FolioRecord])
 async def my_folio(principal: CurrentUser, request: Request, session: SessionDep):
     """Records, prescriptions and lab reports, read from the existing system (shown in any brand's app)."""
     return await request.app.state.legacy.folio(await _patient_id(session, principal.user_id))
@@ -220,7 +260,7 @@ async def legacy_order(request: Request, session: SessionDep, x_signature: str =
 
 
 # ---------------------------------------------------------------- dev helper (mock mode)
-@consult.post("/dev/bookings/{legacy_booking_id}/prescribe", tags=["dev"])
+@consult.post("/dev/bookings/{legacy_booking_id}/prescribe", tags=["dev"], response_model=Accepted)
 async def dev_prescribe(legacy_booking_id: str, body: PrescribeRequest, request: Request, session: SessionDep):
     """Mock mode only: simulates the doctor issuing an e-prescription at the end of a video consult."""
     if settings.legacy_mode != "mock":

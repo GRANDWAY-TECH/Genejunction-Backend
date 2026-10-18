@@ -22,6 +22,7 @@ from app.schemas import (
     TenantPatch,
 )
 from gj_common.auth import GJ_ADMIN, GJ_OPS, TENANT_ADMIN, CurrentUser, InternalOnly, require_roles, staff_only
+from gj_common.contracts import RoleGranted
 from gj_common.db import SessionDep
 from gj_common.errors import Conflict, NotFound, ValidationFailed
 from gj_common.events import emit
@@ -60,6 +61,8 @@ def _member_event(session: AsyncSession, member: NetworkMember, event_type: str 
 
 @public.get("/current", response_model=PublicTenant)
 async def current_tenant(tenant: CurrentTenant, session: SessionDep):
+    """Brand configuration the website and mobile app load at start-up (name, colours, logo, enabled features).
+    No login needed. The brand comes from the domain or the `X-Tenant` header."""
     row = await _tenant(session, tenant.id)
     return PublicTenant(
         id=row.id, slug=row.slug, name=row.name, type=row.type, channel=tenant.channel,
@@ -191,7 +194,7 @@ async def delete_domain(tenant_id: uuid.UUID, domain_id: uuid.UUID, principal: C
     await invalidate_tenant_cache(request.app.state.redis, tenant_id)
 
 
-@public.post("/{tenant_id}/admins", status_code=201)
+@public.post("/{tenant_id}/admins", status_code=201, response_model=RoleGranted)
 async def invite_admin(tenant_id: uuid.UUID, body: AdminInvite, principal: CurrentUser, request: Request, session: SessionDep):
     principal.ensure_tenant_admin(tenant_id)
     await _tenant(session, tenant_id)

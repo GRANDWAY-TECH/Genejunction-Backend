@@ -19,7 +19,10 @@ from app.schemas import (
     OtpVerify,
     PasswordLogin,
     RefreshRequest,
+    Granted,
+    Jwks,
     RoleGrant,
+    TokenResponse,
     UserLookup,
     UserOut,
     UserUpdate,
@@ -56,20 +59,24 @@ def _registered(session: AsyncSession, user: User, tenant_id: uuid.UUID) -> None
     )
 
 
-@router.get("/.well-known/jwks.json", tags=["auth"])
+@router.get("/.well-known/jwks.json", tags=["auth"], response_model=Jwks)
 async def jwks():
     return keystore.jwks
 
 
 @auth.post("/otp/request", response_model=OtpRequested)
 async def request_otp(body: OtpRequest, request: Request, tenant: CurrentTenant):
+    """Send a 6-digit login code by SMS (in the brand's name). Malaysian local numbers (`012…`) are accepted.
+    Limits: one code per 30 s and 5 per hour per number; codes expire after 5 minutes."""
     phone = otp.normalize_phone(body.phone)
     code = await otp.request_otp(request.app.state.redis, phone, tenant.name)
     return OtpRequested(expires_in=settings.otp_ttl, debug_otp=code if settings.otp_debug_return else None)
 
 
-@auth.post("/otp/verify")
+@auth.post("/otp/verify", response_model=TokenResponse)
 async def verify_otp(body: OtpVerify, request: Request, session: SessionDep, tenant: CurrentTenant):
+    """Patients sign up and log in here. Creates the account on first use and links it to the patient's
+    record in the existing GeneJunction system. 5 wrong attempts invalidate the code."""
     phone = otp.normalize_phone(body.phone)
     await otp.verify_otp(request.app.state.redis, phone, body.code)
     user = await session.scalar(select(User).where(User.phone == phone))
@@ -87,7 +94,7 @@ async def verify_otp(body: OtpVerify, request: Request, session: SessionDep, ten
     return tokens
 
 
-@auth.post("/signup", status_code=201)
+@auth.post("/signup", status_code=201, response_model=TokenResponse)
 async def business_signup(body: BusinessSignup, session: SessionDep, tenant: CurrentTenant):
     """Email + password accounts for partner portal / business console users."""
     email = body.email.lower()
@@ -106,8 +113,10 @@ async def business_signup(body: BusinessSignup, session: SessionDep, tenant: Cur
     return tokens
 
 
-@auth.post("/login")
+@auth.post("/login", response_model=TokenResponse)
 async def password_login(body: PasswordLogin, session: SessionDep, tenant: CurrentTenant):
+    """Email + password login for partner portals, the business console and GJ staff.
+    Log in with `X-Tenant` set to get a session for that brand (needed for `tenant_admin`)."""
     user = await session.scalar(select(User).where(User.email == body.email.lower()))
     if user is None or not user.password_hash:
         raise Unauthorized("Invalid email or password", code="invalid_credentials")
@@ -126,8 +135,11 @@ async def password_login(body: PasswordLogin, session: SessionDep, tenant: Curre
     return tokens
 
 
-@auth.post("/refresh")
+@auth.post("/refresh", response_model=TokenResponse)
 async def refresh(body: RefreshRequest, session: SessionDep):
+    """Exchange a refresh token for new tokens. Also call this after registering a partner or being granted a
+    role, so the access token carries the new `roles` / `partner_ids`. Reusing an old refresh token
+    revokes the whole session (theft protection)."""
     row = await session.scalar(
         select(RefreshToken).where(RefreshToken.token_hash == hash_token(body.refresh_token)).with_for_update()
     )
@@ -198,7 +210,7 @@ async def list_users(session: SessionDep, page: PageDep, q: str | None = Query(N
     return await paginate(session, stmt, page)
 
 
-@users.post("/{user_id}/roles", status_code=201, dependencies=[require_roles(GJ_ADMIN)])
+@users.post("/{user_id}/roles", status_code=201, response_model=Granted, dependencies=[require_roles(GJ_ADMIN)])
 async def grant_role(user_id: uuid.UUID, body: RoleGrant, session: SessionDep):
     await _grant(session, user_id, body)
     await session.commit()

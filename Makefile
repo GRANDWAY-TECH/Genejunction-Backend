@@ -1,7 +1,7 @@
 SERVICES_PG := identity tenant partner order payment billing pharmacy lab wholesale notification legacy_bridge
 PY := $(CURDIR)/.venv/bin/python
 
-.PHONY: venv up down logs ps test e2e migration
+.PHONY: venv up down logs ps test e2e migration docs
 
 venv:
 	python3.12 -m venv .venv
@@ -32,3 +32,7 @@ e2e:
 migration:
 	cd services/$(s) && DATABASE_URL=postgresql+asyncpg://gj:gj@127.0.0.1:55432/gj_$(if $(filter legacy_bridge,$(s)),bridge,$(s)) \
 		$(PY) -m alembic revision --autogenerate -m "$(m)"
+
+## Rebuild the merged API reference (docs/api/openapi.json, served at http://localhost:8080/docs/)
+docs:
+	$(PY) scripts/build_api_docs.py

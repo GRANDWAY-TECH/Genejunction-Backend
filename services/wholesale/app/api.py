@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import POLine, PurchaseOrder
 from gj_common.auth import CurrentUser, Principal
+from gj_common.contracts import PaymentRef
 from gj_common.db import SessionDep, uuid7
 from gj_common.errors import AppError, Conflict, NotFound, ValidationFailed
 from gj_common.events import emit
@@ -69,6 +70,18 @@ class POOut(BaseModel):
     lines: list[LineOut]
 
 
+class POCreated(BaseModel):
+    purchase_order: POOut
+    payment: PaymentRef | None = Field(description="Prepaid orders only: pay at `payment.checkout_url`")
+
+
+class POPage(BaseModel):
+    items: list[POOut]
+    total: int
+    limit: int
+    offset: int
+
+
 class Reason(BaseModel):
     reason: str
 
@@ -101,7 +114,7 @@ def _as_buyer(principal: Principal, po: PurchaseOrder) -> None:
     principal.ensure_partner(po.buyer_partner_id)
 
 
-@router.post("/purchase-orders", status_code=201)
+@router.post("/purchase-orders", status_code=201, response_model=POCreated)
 async def create_po(body: POCreate, principal: CurrentUser, request: Request, session: SessionDep):
     """A pharmacy, lab or clinic restocks from one stockist. Tier prices come from the catalog."""
     principal.ensure_partner(body.buyer_partner_id)
@@ -152,7 +165,7 @@ async def create_po(body: POCreate, principal: CurrentUser, request: Request, se
     return {"purchase_order": POOut.model_validate(po), "payment": payment}
 
 
-@router.get("/purchase-orders")
+@router.get("/purchase-orders", response_model=POPage)
 async def list_pos(partner_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep,
                    role: Literal["buyer", "stockist"] = "buyer", status: str | None = None):
     principal.ensure_partner(partner_id)

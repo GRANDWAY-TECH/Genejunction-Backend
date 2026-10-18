@@ -12,6 +12,14 @@ from app.config import settings
 from app.mongo import Mongo, from_mongo, to_mongo
 from app.schemas import (
     FeatureRequest,
+    OfferOut,
+    OfferPage,
+    PartnerOfferOut,
+    ProductDetail,
+    ProductOut,
+    ProductPage,
+    SearchPage,
+    StockUpdated,
     OfferCreate,
     OfferPatch,
     PrescriptionMatchRequest,
@@ -68,7 +76,7 @@ async def _publish(request: Request, event_type: str, key: str, data: dict) -> N
 
 
 # ---------------------------------------------------------------- browse & search
-@router.get("/search")
+@router.get("/search", response_model=SearchPage)
 async def search(
     request: Request,
     tenant: CurrentTenant,
@@ -84,7 +92,10 @@ async def search(
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0, le=5000),
 ):
-    """Products with their best visible offer for the caller's brand (marketplace or white label)."""
+    """Search medicines, lab tests and wellness products. Returns one row per product with its best offer and
+    how many providers sell it. Only providers visible in the caller's app are included: every listed provider on
+    GeneJunction, or only the clinic group's own network in a white-label app. Pass `lat`/`lng` to limit to
+    providers near the patient."""
     match: dict = {"channel": "retail", "active": True, **visibility.tenant_filter(tenant), **_IN_STOCK}
     if q:
         match["$text"] = {"$search": q}
@@ -124,7 +135,7 @@ async def search(
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/categories")
+@router.get("/categories", response_model=list[str])
 async def categories(request: Request, tenant: CurrentTenant, type: str | None = None):
     match = {"channel": "retail", "active": True, **visibility.tenant_filter(tenant)}
     if type:
@@ -132,7 +143,7 @@ async def categories(request: Request, tenant: CurrentTenant, type: str | None =
     return sorted(c for c in await _mongo(request).offers.distinct("product.category", match) if c)
 
 
-@router.get("/products/{product_id}")
+@router.get("/products/{product_id}", response_model=ProductDetail)
 async def get_product(product_id: str, request: Request, tenant: CurrentTenant):
     mongo = _mongo(request)
     product = await mongo.products.find_one({"_id": product_id})
@@ -144,7 +155,7 @@ async def get_product(product_id: str, request: Request, tenant: CurrentTenant):
     return {**from_mongo(product), "offers": offers}
 
 
-@router.get("/offers/{offer_id}")
+@router.get("/offers/{offer_id}", response_model=OfferOut)
 async def get_offer(offer_id: str, request: Request, tenant: CurrentTenant):
     offer = await _mongo(request).offers.find_one({"_id": offer_id})
     if offer is None or not visibility.visible_to(offer, tenant):
@@ -154,7 +165,7 @@ async def get_offer(offer_id: str, request: Request, tenant: CurrentTenant):
 
 
 # ---------------------------------------------------------------- master products
-@router.post("/products", status_code=201)
+@router.post("/products", status_code=201, response_model=ProductOut)
 async def create_product(body: ProductCreate, request: Request, principal: CurrentUser,
                          partner_id: str | None = Query(None, description="Partner proposing the product")):
     if principal.is_staff:
@@ -173,7 +184,7 @@ async def create_product(body: ProductCreate, request: Request, principal: Curre
     return from_mongo(doc)
 
 
-@router.get("/products")
+@router.get("/products", response_model=ProductPage)
 async def list_products(request: Request, q: str | None = None, type: str | None = None,
                         status: str = "active", limit: int = Query(20, le=100), offset: int = 0):
     """The master product list partners pick from when adding offers."""
@@ -188,7 +199,7 @@ async def list_products(request: Request, q: str | None = None, type: str | None
             "limit": limit, "offset": offset}
 
 
-@router.patch("/products/{product_id}", dependencies=[require_roles(GJ_ADMIN, GJ_OPS)])
+@router.patch("/products/{product_id}", response_model=ProductOut, dependencies=[require_roles(GJ_ADMIN, GJ_OPS)])
 async def patch_product(product_id: str, body: ProductPatch, request: Request):
     mongo = _mongo(request)
     changes = body.model_dump(exclude_unset=True)
@@ -212,9 +223,10 @@ async def _partner_guard(request: Request, principal, partner_id: str) -> dict:
     return await visibility.ensure_partner(st.mongo, st.partners, st.tenants, partner_id)
 
 
-@router.get("/partners/{partner_id}/offers")
+@router.get("/partners/{partner_id}/offers", response_model=OfferPage)
 async def partner_offers(partner_id: str, request: Request, principal: CurrentUser, channel: str | None = None,
                          low_stock: bool = False, limit: int = Query(50, le=200), offset: int = 0):
+    """Partner portal "Products & stock": the partner's own offers, including where each is visible."""
     principal.ensure_partner(uuid.UUID(partner_id))
     flt: dict = {"partner_id": partner_id}
     if channel:
@@ -227,8 +239,10 @@ async def partner_offers(partner_id: str, request: Request, principal: CurrentUs
             "limit": limit, "offset": offset}
 
 
-@router.post("/partners/{partner_id}/offers", status_code=201)
+@router.post("/partners/{partner_id}/offers", status_code=201, response_model=PartnerOfferOut)
 async def create_offer(partner_id: str, body: OfferCreate, request: Request, principal: CurrentUser):
+    """Sell a product from the master list. Pharmacies sell medicine (retail), labs sell lab tests, stockists
+    sell on the wholesale channel with optional quantity tiers. Offers go live once the partner is verified."""
     pv = await _partner_guard(request, principal, partner_id)
     mongo = _mongo(request)
     product = await mongo.products.find_one({"_id": body.product_id})
@@ -260,7 +274,7 @@ async def create_offer(partner_id: str, body: OfferCreate, request: Request, pri
     return from_mongo(await mongo.offers.find_one({"_id": doc["_id"]}))
 
 
-@router.patch("/partners/{partner_id}/offers/{offer_id}")
+@router.patch("/partners/{partner_id}/offers/{offer_id}", response_model=PartnerOfferOut)
 async def patch_offer(partner_id: str, offer_id: str, body: OfferPatch, request: Request, principal: CurrentUser):
     principal.ensure_partner(uuid.UUID(partner_id))
     changes = body.model_dump(exclude_unset=True)
@@ -274,7 +288,7 @@ async def patch_offer(partner_id: str, offer_id: str, body: OfferPatch, request:
     return from_mongo(doc)
 
 
-@router.post("/partners/{partner_id}/offers/stock")
+@router.post("/partners/{partner_id}/offers/stock", response_model=StockUpdated)
 async def bulk_stock(partner_id: str, body: list[StockUpdate], request: Request, principal: CurrentUser):
     principal.ensure_partner(uuid.UUID(partner_id))
     mongo = _mongo(request)
@@ -286,7 +300,7 @@ async def bulk_stock(partner_id: str, body: list[StockUpdate], request: Request,
     return {"updated": updated}
 
 
-@router.get("/wholesale/search")
+@router.get("/wholesale/search", response_model=OfferPage)
 async def wholesale_search(request: Request, principal: CurrentUser, q: str | None = None,
                            stockist_id: str | None = None, limit: int = Query(20, le=50), offset: int = 0):
     """Stockist catalogue for pharmacies, labs and clinics restocking (B2B)."""

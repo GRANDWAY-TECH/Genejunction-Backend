@@ -12,6 +12,7 @@ from app.config import settings
 from app.models import LabBooking, SlotCapacity
 from app.summarizer import summarizer
 from gj_common.auth import CurrentUser, Principal
+from gj_common.contracts import UploadTicket
 from gj_common.db import SessionDep
 from gj_common.errors import AppError, Conflict, NotFound
 from gj_common.events import emit
@@ -43,6 +44,33 @@ class BookingOut(BaseModel):
     ai_summary: str | None
     ai_summary_status: str
     rejection_reason: str | None
+
+
+class SlotOut(BaseModel):
+    slot: str = Field(examples=["08:00-10:00"])
+    capacity: int
+    available: int
+
+
+class SlotAvailability(BaseModel):
+    date: date
+    slots: list[SlotOut]
+
+
+class BookingPage(BaseModel):
+    items: list[BookingOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class ReportAccess(BaseModel):
+    download_url: str = Field(description="Short-lived PDF link")
+    ai_summary: str | None
+
+
+class Updated(BaseModel):
+    updated: int
 
 
 class SlotConfig(BaseModel):
@@ -95,8 +123,9 @@ async def _move(request: Request, session: AsyncSession, b: LabBooking, status: 
 
 
 # ---------------------------------------------------------------- slots (patients pick, labs configure)
-@router.get("/{partner_id}/slots")
+@router.get("/{partner_id}/slots", response_model=SlotAvailability)
 async def slots(partner_id: uuid.UUID, session: SessionDep, day: date = Query(..., alias="date")):
+    """Sample-collection slots and remaining capacity for a lab on a day (shown to patients at checkout)."""
     rows = {r.slot: r for r in (await session.scalars(select(SlotCapacity).where(
         SlotCapacity.partner_id == partner_id, SlotCapacity.day == day))).all()}
     out = []
@@ -108,7 +137,7 @@ async def slots(partner_id: uuid.UUID, session: SessionDep, day: date = Query(..
     return {"date": day, "slots": out}
 
 
-@router.put("/{partner_id}/slots")
+@router.put("/{partner_id}/slots", response_model=Updated)
 async def configure_slots(partner_id: uuid.UUID, body: list[SlotConfig], principal: CurrentUser, session: SessionDep):
     principal.ensure_partner(partner_id)
     for s in body[:200]:
@@ -121,7 +150,7 @@ async def configure_slots(partner_id: uuid.UUID, body: list[SlotConfig], princip
 
 
 # ---------------------------------------------------------------- lab portal
-@router.get("/{partner_id}/bookings")
+@router.get("/{partner_id}/bookings", response_model=BookingPage)
 async def list_bookings(partner_id: uuid.UUID, principal: CurrentUser, session: SessionDep, page: PageDep,
                         status: str | None = None, day: date | None = Query(None, alias="date")):
     principal.ensure_partner(partner_id)
@@ -178,7 +207,7 @@ async def processing(booking_id: uuid.UUID, principal: CurrentUser, request: Req
     return await _move(request, session, b, "processing", f"user:{principal.user_id}")
 
 
-@router.post("/bookings/{booking_id}/report-upload")
+@router.post("/bookings/{booking_id}/report-upload", response_model=UploadTicket)
 async def report_upload(booking_id: uuid.UUID, body: UploadRequest, principal: CurrentUser, request: Request,
                         session: SessionDep):
     b = await _load(session, principal, booking_id)
@@ -193,6 +222,9 @@ async def report_upload(booking_id: uuid.UUID, body: UploadRequest, principal: C
 @router.post("/bookings/{booking_id}/report-ready", response_model=BookingOut)
 async def report_ready(booking_id: uuid.UUID, body: ReportReady, principal: CurrentUser, request: Request,
                        session: SessionDep):
+    """Publish the uploaded report: the patient is notified, it is saved to their health folio and the booking
+    completes. With `ai_summary` a plain-language summary is added for 10 credits (charged to the clinic group
+    in its white-label app, otherwise to the lab). If credits are paused the report is still published without it."""
     b = await _load(session, principal, booking_id)
     if not b.report_key:
         raise Conflict("Upload the report first", code="report_missing")
@@ -233,13 +265,13 @@ async def _ai_summary(request: Request, b: LabBooking) -> None:
 
 
 # ---------------------------------------------------------------- patients
-@router.get("/my-bookings")
+@router.get("/my-bookings", response_model=BookingPage)
 async def my_bookings(principal: CurrentUser, session: SessionDep, page: PageDep):
     stmt = select(LabBooking).where(LabBooking.user_id == principal.user_id).order_by(LabBooking.created_at.desc())
     return await paginate(session, stmt, page, BookingOut.model_validate)
 
 
-@router.get("/my-bookings/{booking_id}/report")
+@router.get("/my-bookings/{booking_id}/report", response_model=ReportAccess)
 async def my_report(booking_id: uuid.UUID, principal: CurrentUser, request: Request, session: SessionDep):
     b = await session.get(LabBooking, booking_id)
     if b is None or b.user_id != principal.user_id:

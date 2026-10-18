@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Annotated, Literal
 
-from fastapi import Depends, Request
+from fastapi import Depends, Header, Request
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
@@ -83,7 +83,14 @@ def request_tenant_hints(request: Request) -> tuple[str | None, str | None]:
     return slug, host
 
 
-async def get_tenant(request: Request) -> TenantContext:
+async def get_tenant(
+    request: Request,
+    x_tenant: str | None = Header(
+        None,
+        description="Tenant (brand) slug, e.g. `sejahtera`. Sent by white-label mobile builds. "
+        "Web apps can omit it: the brand is taken from the domain. Omitted on genejunction.com = GeneJunction marketplace.",
+    ),
+) -> TenantContext:
     slug, host = request_tenant_hints(request)
     return await request.app.state.tenant_resolver.resolve(slug=slug, host=host)
 

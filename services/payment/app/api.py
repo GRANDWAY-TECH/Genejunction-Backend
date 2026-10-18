@@ -63,6 +63,12 @@ class PaymentOut(BaseModel):
     created_at: datetime
 
 
+class MockCompletion(BaseModel):
+    payment_id: uuid.UUID
+    status: str = Field(description="succeeded | failed (or duplicate / ignored)")
+    return_url: str | None
+
+
 class RefundCreate(BaseModel):
     amount: Decimal = Field(gt=0, decimal_places=2)
     reason: str
@@ -172,9 +178,10 @@ async def webhook(provider_name: str, request: Request, session: SessionDep):
     return {"result": await apply_webhook(session, provider_name, result, json.loads(body))}
 
 
-@public.post("/mock/{payment_id}/complete", tags=["dev"])
+@public.post("/mock/{payment_id}/complete", tags=["dev"], response_model=MockCompletion)
 async def mock_complete(payment_id: uuid.UUID, session: SessionDep, outcome: Literal["succeeded", "failed"] = "succeeded"):
-    """Dev only: behaves like the gateway calling our webhook after the customer pays."""
+    """**Development only** (disabled in production). Simulates the customer finishing payment at
+    `checkout_url`: the gateway webhook is processed exactly as a real one would be."""
     if not settings.enable_mock_gateway:
         raise NotFound()
     payment = await session.get(Payment, payment_id)

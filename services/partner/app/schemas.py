@@ -107,3 +107,10 @@ class StaffInvite(BaseModel):
     email: EmailStr
     full_name: str | None = None
     role: Literal["partner_admin", "partner_staff"] = "partner_staff"
+
+
+class ReviewEntry(BaseModel):
+    action: str
+    actor_id: uuid.UUID
+    note: str | None
+    at: datetime
