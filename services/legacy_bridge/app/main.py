@@ -12,7 +12,7 @@ from app.legacy import HttpLegacyClient, MockLegacyClient
 from app.models import ConsultBooking, ConsultHold, DoctorPartner, PatientLink
 from gj_common.app_factory import ServiceSpec, create_service_app
 from gj_common.errors import AppError
-from gj_common.events import EventEnvelope, emit
+from gj_common.events import EventEnvelope, RetryLater, emit, is_transient
 from gj_common.http import ServiceClient
 from gj_common.logging import get_logger
 from gj_common.storage import ObjectStorage
@@ -69,6 +69,8 @@ async def on_order_paid(event: EventEnvelope, session) -> None:
             booked = await app.state.legacy.book(doctor_id=hold.doctor_id, slot_id=hold.slot_id, patient_id=patient_id,
                                                  external_ref=str(sub_id), amount=Decimal(str(sub["total"])))
         except AppError as exc:
+            if is_transient(exc):
+                raise  # PHP system or identity unreachable: retry until it is back, never refund for an outage
             log.warning("legacy_booking_failed", sub_order=str(sub_id), error=exc.message)
             hold.status = "released"
             await app.state.orders.post(f"/internal/sub-orders/{sub_id}/status", json={
@@ -89,7 +91,7 @@ async def on_report_ready(event: EventEnvelope, session) -> None:
     d = event.data
     link = await session.get(PatientLink, uuid.UUID(d["user_id"]))
     if link is None:
-        raise RuntimeError("patient not linked yet")  # retried; linking runs on registration
+        raise RetryLater("patient not linked yet")  # linking runs on registration; wait for it
     await state["app"].state.legacy.add_folio_record(link.legacy_patient_id, {
         "type": "lab_report", "title": ", ".join(t["name"] for t in d["tests"]), "date": d["collected_on"],
         "source": d.get("partner_name"), "document_key": d["report_key"],

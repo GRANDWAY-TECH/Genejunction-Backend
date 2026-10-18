@@ -202,16 +202,25 @@ async def ledger(owner_type: OwnerType, owner_id: uuid.UUID, principal: CurrentU
 
 
 async def create_topup(payments, session: AsyncSession, w: CreditWallet, pack_code: str, method: str,
-                       return_url: str | None, requested_by: uuid.UUID | None, automatic: bool = False) -> dict:
+                       return_url: str | None, requested_by: uuid.UUID | None, automatic: bool = False,
+                       topup_id: uuid.UUID | None = None) -> dict:
+    """Records the top-up, then opens its payment. From an API call the top-up is committed first, so a
+    payment can never exist for a top-up billing does not know. From an event handler (`topup_id` given,
+    derived from the event) everything stays in the handler's transaction and a retry reuses the same ids."""
     pack = await session.get(CreditPack, pack_code)
     if pack is None or not pack.active:
         raise NotFound("Unknown credit pack")
     sst = pct_of(pack.price, settings.sst_rate)
-    topup = TopUp(id=uuid.uuid4(), wallet_id=w.id, pack_code=pack.code, price=pack.price, sst_amount=sst,
-                  total=money(pack.price + sst), credits=pack.credits, bonus_credits=pack.bonus_credits,
-                  requested_by=requested_by, automatic=automatic)
-    session.add(topup)
-    await session.flush()
+    if topup_id is not None and (existing := await session.get(TopUp, topup_id)) is not None:
+        topup = existing
+    else:
+        topup = TopUp(id=topup_id or uuid.uuid4(), wallet_id=w.id, pack_code=pack.code, price=pack.price,
+                      sst_amount=sst, total=money(pack.price + sst), credits=pack.credits,
+                      bonus_credits=pack.bonus_credits, requested_by=requested_by, automatic=automatic)
+        session.add(topup)
+        await session.flush()
+    if topup_id is None:
+        await session.commit()
     payment = await payments.post("/internal/payments", json={
         "purpose": "credit_topup", "reference_id": str(topup.id), "amount": str(topup.total), "currency": "MYR",
         "method": method, "payer_type": w.owner_type, "payer_id": str(w.owner_id),

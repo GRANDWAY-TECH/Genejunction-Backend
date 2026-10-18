@@ -81,10 +81,17 @@ MOCK_DOCTORS = [
 
 
 class MockLegacyClient:
+    """Dev/test stand-in. `SET legacy-mock:down 1` in Redis simulates the PHP system being unreachable."""
+
     def __init__(self, redis: Redis) -> None:
         self.r = redis
 
+    async def _up(self) -> None:
+        if await self.r.exists("legacy-mock:down"):
+            raise UpstreamError("GeneJunction core system unreachable")
+
     async def list_doctors(self, specialty, q):
+        await self._up()
         docs = MOCK_DOCTORS
         if specialty:
             docs = [d for d in docs if d["specialty"].lower() == specialty.lower()]
@@ -93,6 +100,7 @@ class MockLegacyClient:
         return docs
 
     async def get_doctor(self, doctor_id):
+        await self._up()
         for d in MOCK_DOCTORS:
             if d["id"] == doctor_id:
                 return d
@@ -111,6 +119,7 @@ class MockLegacyClient:
         return slots
 
     async def find_or_create_patient(self, phone, name, email):
+        await self._up()
         key = phone or email
         existing = await self.r.hget("legacy-mock:patients", key)
         if existing:
@@ -120,19 +129,28 @@ class MockLegacyClient:
         return pid
 
     async def book(self, *, doctor_id, slot_id, patient_id, external_ref, amount):
+        await self._up()
+        # Same external_ref = same booking (the contract asks PHP for this), so a retried call never double-books.
+        if existing := await self.r.hget("legacy-mock:booking-by-ref", external_ref):
+            return json.loads(existing)
         if not await self.r.sadd(f"legacy-mock:booked:{doctor_id}", slot_id):
             raise UpstreamError("Slot already booked in core system")
         booking_id = f"bk-{secrets.token_hex(4)}"
         await self.r.hset("legacy-mock:bookings", booking_id, json.dumps(
             {"doctor_id": doctor_id, "slot_id": slot_id, "patient_id": patient_id, "external_ref": external_ref}))
-        return {"booking_id": booking_id, "video_url": f"https://consult.genejunction.com/room/{booking_id}"}
+        result = {"booking_id": booking_id, "video_url": f"https://consult.genejunction.com/room/{booking_id}"}
+        await self.r.hset("legacy-mock:booking-by-ref", external_ref, json.dumps(result))
+        return result
 
     async def folio(self, patient_id):
+        await self._up()
         return [json.loads(x) for x in await self.r.lrange(f"legacy-mock:folio:{patient_id}", 0, 200)]
 
     async def add_folio_record(self, patient_id, record):
+        await self._up()
         await self.r.lpush(f"legacy-mock:folio:{patient_id}", json.dumps(
             {"id": f"rec-{secrets.token_hex(4)}", **record}))
 
     async def push_order(self, patient_id, order):
+        await self._up()
         await self.r.lpush(f"legacy-mock:orders:{patient_id}", json.dumps(order))

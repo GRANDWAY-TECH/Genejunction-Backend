@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -10,11 +11,12 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
+from sqlalchemy import delete, func, select
 
-from gj_common.auth import JWKSCache
+from gj_common.auth import InternalOnly, JWKSCache
 from gj_common.db import Database
 from gj_common.errors import ERROR_RESPONSES, install_error_handlers
-from gj_common.events import set_event_source
+from gj_common.events import OutboxEvent, ProcessedEvent, set_event_source, topic_for
 from gj_common.events.kafka import EventBus, EventConsumer, Handler, OutboxRelay
 from gj_common.http import ServiceClient
 from gj_common.jobs import PeriodicJob
@@ -41,6 +43,14 @@ class ServiceSpec:
     on_startup: list[Hook] = field(default_factory=list)
     on_shutdown: list[Hook] = field(default_factory=list)
     uses_postgres: bool = True
+
+
+async def _event_housekeeping(app: FastAPI) -> None:
+    """Dedupe rows are kept 30 days (far beyond Kafka redelivery); published outbox rows 7 days."""
+    now = datetime.now(timezone.utc)
+    async with app.state.db.sessionmaker() as session, session.begin():
+        await session.execute(delete(ProcessedEvent).where(ProcessedEvent.processed_at < now - timedelta(days=30)))
+        await session.execute(delete(OutboxEvent).where(OutboxEvent.published_at < now - timedelta(days=7)))
 
 
 def create_service_app(spec: ServiceSpec) -> FastAPI:
@@ -81,7 +91,10 @@ def create_service_app(spec: ServiceSpec) -> FastAPI:
                 )
                 tasks.append(asyncio.create_task(consumer.run(), name="consumer"))
         if settings.run_jobs:
-            tasks.extend(asyncio.create_task(job.run_forever(app), name=job.name) for job in spec.jobs)
+            jobs = list(spec.jobs)
+            if app.state.db is not None:
+                jobs.append(PeriodicJob(f"{settings.service_name}-event-housekeeping", 3600, _event_housekeeping))
+            tasks.extend(asyncio.create_task(job.run_forever(app), name=job.name) for job in jobs)
         log.info("service_started", tasks=[t.get_name() for t in tasks])
 
         yield
@@ -136,6 +149,23 @@ def create_service_app(spec: ServiceSpec) -> FastAPI:
                 checks["postgres"] = str(exc)
         ok = all(v == "ok" for v in checks.values())
         return JSONResponse({"ready": ok, "checks": checks}, status_code=200 if ok else 503)
+
+    @app.get("/internal/events/status", include_in_schema=False, dependencies=[InternalOnly])
+    async def events_status():
+        """Event-pipeline health for scripts/event_audit.py: outbox backlog and handled counts."""
+        consumer = ({"group": f"{settings.service_name}-service", "topics": sorted({topic_for(t) for t in spec.event_handlers})}
+                    if spec.event_handlers else None)
+        if app.state.db is None:
+            return {"service": settings.service_name, "outbox": None, "consumer": consumer}
+        async with app.state.db.sessionmaker() as session:
+            pending, oldest = (await session.execute(
+                select(func.count(), func.min(OutboxEvent.created_at)).where(OutboxEvent.published_at.is_(None))
+            )).one()
+            total = await session.scalar(select(func.count()).select_from(OutboxEvent))
+            processed = await session.scalar(select(func.count()).select_from(ProcessedEvent))
+        return {"service": settings.service_name,
+                "outbox": {"pending": pending, "oldest_pending": oldest, "total": total},
+                "processed_events": processed, "consumer": consumer}
 
     for router in spec.routers:
         app.include_router(router, responses=ERROR_RESPONSES)

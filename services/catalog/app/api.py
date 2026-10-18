@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query, Request
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from app import visibility
+from app import stock, visibility
 from app.config import settings
 from app.mongo import Mongo, from_mongo, to_mongo
 from app.schemas import (
@@ -30,8 +30,7 @@ from app.schemas import (
     StockUpdate,
 )
 from gj_common.auth import GJ_ADMIN, GJ_OPS, CurrentUser, InternalOnly, OptionalUser, require_roles
-from gj_common.errors import AppError, Conflict, Forbidden, NotFound, ValidationFailed
-from gj_common.events import EventEnvelope, topic_for
+from gj_common.errors import Conflict, Forbidden, NotFound, ValidationFailed
 from gj_common.db import uuid7
 from gj_common.logging import get_logger
 from gj_common.money import money
@@ -64,15 +63,6 @@ def _product_snapshot(p: dict) -> dict:
         "generic_name": p.get("generic_name"), "requires_prescription": p.get("requires_prescription", False),
         "sku": p["sku"], "lab": p.get("lab"), "image": (p.get("images") or [None])[0],
     }
-
-
-async def _publish(request: Request, event_type: str, key: str, data: dict) -> None:
-    """Best-effort event (catalog has no SQL outbox; these are advisory notifications)."""
-    env = EventEnvelope(id=uuid7(), type=event_type, occurred_at=_now(), source="catalog", key=key, data=data)
-    try:
-        await request.app.state.bus.publish(topic_for(event_type), key, env.model_dump(mode="json"))
-    except Exception as exc:
-        log.warning("event_publish_failed", type=event_type, error=str(exc))
 
 
 # ---------------------------------------------------------------- browse & search
@@ -365,67 +355,18 @@ async def quote(body: QuoteRequest, request: Request):
 
 @internal.post("/reservations")
 async def reserve(body: ReservationRequest, request: Request):
-    """Atomically decrement stock for every tracked item, or none of them."""
-    mongo = _mongo(request)
-    try:
-        await mongo.reservations.insert_one({
-            "_id": body.reservation_id, "status": "pending", "items": [],
-            "expires_at": _now() + timedelta(minutes=settings.reservation_ttl_minutes), "created_at": _now()})
-    except DuplicateKeyError:
-        existing = await mongo.reservations.find_one({"_id": body.reservation_id})
-        return {"reservation_id": body.reservation_id, "status": existing["status"]}
-    done: list[dict] = []
-    for item in body.items:
-        offer = await mongo.offers.find_one({"_id": item.offer_id}, {"stock": 1, "partner_id": 1, "product.name": 1})
-        if offer is None:
-            failure = item.offer_id
-            break
-        if offer.get("stock") is None:
-            continue
-        res = await mongo.offers.find_one_and_update(
-            {"_id": item.offer_id, "stock": {"$gte": item.qty}}, {"$inc": {"stock": -item.qty}},
-            return_document=ReturnDocument.AFTER, projection={"stock": 1})
-        if res is None:
-            failure = item.offer_id
-            break
-        done.append({"offer_id": item.offer_id, "qty": item.qty})
-        if res["stock"] <= settings.low_stock_threshold:
-            await _publish(request, "catalog.stock.low", offer["partner_id"], {
-                "partner_id": offer["partner_id"], "offer_id": item.offer_id,
-                "product_name": offer["product"]["name"], "stock": res["stock"]})
-    else:
-        await mongo.reservations.update_one({"_id": body.reservation_id}, {"$set": {"status": "reserved", "items": done}})
-        return {"reservation_id": body.reservation_id, "status": "reserved"}
-    for d in done:  # compensate
-        await mongo.offers.update_one({"_id": d["offer_id"]}, {"$inc": {"stock": d["qty"]}})
-    await mongo.reservations.update_one({"_id": body.reservation_id}, {"$set": {"status": "failed"}})
-    raise Conflict("Item went out of stock", code="out_of_stock", details=[{"offer_id": failure}])
-
-
-async def release_reservation(mongo: Mongo, reservation_id: str) -> bool:
-    res = await mongo.reservations.find_one_and_update(
-        {"_id": reservation_id, "status": {"$in": ["reserved", "committed"]}}, {"$set": {"status": "released"}})
-    if res is None:
-        return False
-    for d in res["items"]:
-        await mongo.offers.update_one({"_id": d["offer_id"]}, {"$inc": {"stock": d["qty"]}})
-    return True
+    """All-or-nothing stock hold for a checkout; safe to repeat with the same id."""
+    return await stock.reserve(_mongo(request), body.reservation_id, [i.model_dump() for i in body.items])
 
 
 @internal.post("/reservations/{reservation_id}/release")
 async def release(reservation_id: str, request: Request):
-    return {"released": await release_reservation(_mongo(request), reservation_id)}
+    return {"released": await stock.release(_mongo(request), reservation_id)}
 
 
 @internal.post("/reservations/{reservation_id}/commit")
 async def commit(reservation_id: str, request: Request):
-    res = await _mongo(request).reservations.find_one_and_update(
-        {"_id": reservation_id, "status": "reserved"}, {"$set": {"status": "committed"}},
-        return_document=ReturnDocument.AFTER)
-    if res is None:
-        current = await _mongo(request).reservations.find_one({"_id": reservation_id})
-        return {"status": current["status"] if current else "missing"}
-    return {"status": "committed"}
+    return {"status": await stock.commit(_mongo(request), reservation_id)}
 
 
 @internal.post("/prescription-match")
@@ -466,13 +407,3 @@ async def feature_partner(body: FeatureRequest, request: Request):
     res = await _mongo(request).offers.update_many(
         {"partner_id": str(body.partner_id), "channel": "retail"}, {"$set": {"featured_until": body.until}})
     return {"offers_featured": res.modified_count}
-
-
-@internal.post("/stock-adjust")
-async def stock_adjust(request: Request, partner_id: str, product_id: str, delta: int):
-    res = await _mongo(request).offers.update_one(
-        {"partner_id": partner_id, "product_id": product_id, "channel": "retail", "stock": {"$ne": None}},
-        {"$inc": {"stock": delta}, "$set": {"updated_at": _now()}})
-    if res.matched_count == 0:
-        raise AppError("No stock-tracked offer for this product", code="no_offer", status_code=404)
-    return {"adjusted": True}

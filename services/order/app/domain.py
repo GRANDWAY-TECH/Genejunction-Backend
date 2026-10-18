@@ -291,13 +291,7 @@ async def apply_sub_order_status(app: FastAPI, session: AsyncSession, sub_order_
 
     if new in ("rejected", "cancelled", "booking_failed") and old != "pending_payment":
         await refund_sub_order(app, session, order, sub, note or new)
-        if sub.kind == "pharmacy" and old in ("placed", "accepted", "rx_verified"):
-            for item in sub.items:  # put the stock back
-                try:
-                    await app.state.catalog.post("/internal/catalog/stock-adjust", params={
-                        "partner_id": str(sub.partner_id), "product_id": item.product_id, "delta": item.qty})
-                except AppError:
-                    pass
+        # Stock for a pharmacy part that was never sent is returned by the catalog from this same event.
 
     await _roll_up(session, order)
     return sub

@@ -1,9 +1,7 @@
-from datetime import datetime, timezone
-
 from fastapi import FastAPI
 
-from app import visibility
-from app.api import internal, release_reservation, router
+from app import outbox, stock, visibility
+from app.api import internal, router
 from app.config import settings
 from app.mongo import Mongo
 from gj_common.app_factory import ServiceSpec, create_service_app
@@ -12,6 +10,9 @@ from gj_common.http import ServiceClient
 from gj_common.jobs import PeriodicJob
 
 state: dict = {}
+
+# Stock was sold to this sub-order; these statuses mean the pharmacy never sent it.
+RESTOCK_FROM = {"placed", "accepted", "rx_verified"}
 
 
 async def startup(app: FastAPI) -> None:
@@ -39,27 +40,28 @@ async def on_member_removed(event: EventEnvelope, _session) -> None:
 
 
 async def on_po_received(event: EventEnvelope, _session) -> None:
-    """Restock from a stockist: add received quantities to the buyer's own retail offers.
-    Idempotent via a marker on the purchase order id."""
-    mongo = state["mongo"]
-    marker = f"po-received:{event.data['po_id']}"
-    if await mongo.reservations.find_one({"_id": marker}):
+    """Restock from a stockist: add received quantities to the buyer's retail offers, once per line."""
+    d = event.data
+    for line in d["lines"]:
+        await stock.apply_once(state["mongo"],
+                               {"partner_id": d["buyer_partner_id"], "product_id": line["product_id"],
+                                "channel": "retail"},
+                               int(line["qty"]), f"po-received:{d['po_id']}:{line['product_id']}")
+
+
+async def on_sub_order_status(event: EventEnvelope, _session) -> None:
+    """A pharmacy rejected (or the order cancelled) a part it had not sent: put that stock back, once."""
+    d = event.data
+    if d["kind"] != "pharmacy" or d["status"] not in ("rejected", "cancelled") or d.get("old_status") not in RESTOCK_FROM:
         return
-    for line in event.data["lines"]:
-        await mongo.offers.update_one(
-            {"partner_id": event.data["buyer_partner_id"], "product_id": line["product_id"], "channel": "retail",
-             "stock": {"$ne": None}},
-            {"$inc": {"stock": int(line["qty"])}})
-    await mongo.reservations.insert_one({"_id": marker, "status": "applied", "items": [],
-                                         "expires_at": datetime(2100, 1, 1, tzinfo=timezone.utc)})
+    for item in d["items"]:
+        if item.get("offer_id"):
+            await stock.apply_once(state["mongo"], {"_id": item["offer_id"]}, int(item["qty"]),
+                                   f"restock:{d['sub_order_id']}:{item['offer_id']}")
 
 
 async def expire_reservations(app: FastAPI) -> None:
-    mongo: Mongo = app.state.mongo
-    stale = await mongo.reservations.find(
-        {"status": "reserved", "expires_at": {"$lt": datetime.now(timezone.utc)}}, {"_id": 1}).to_list(500)
-    for r in stale:
-        await release_reservation(mongo, r["_id"])
+    await stock.expire(app.state.mongo)
 
 
 partner_events = ["partner.registered", "partner.updated", "partner.verified", "partner.rejected", "partner.suspended"]
@@ -78,7 +80,12 @@ app = create_service_app(
             "tenant.network.member_upserted": on_member_upserted,
             "tenant.network.member_removed": on_member_removed,
             "wholesale.po.received": on_po_received,
+            "order.sub_order.status_changed": on_sub_order_status,
         },
-        jobs=[PeriodicJob("expire-reservations", 60, expire_reservations)],
+        jobs=[
+            PeriodicJob("expire-reservations", 60, expire_reservations),
+            PeriodicJob("catalog-outbox-relay", 2, outbox.relay),
+            PeriodicJob("low-stock-alerts", 60, outbox.low_stock_alerts),
+        ],
     )
 )

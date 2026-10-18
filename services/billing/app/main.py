@@ -130,7 +130,8 @@ async def on_low_balance(event: EventEnvelope, session) -> None:
         return
     wallet = await session.get(CreditWallet, uuid.UUID(event.data["wallet_id"]))
     # With a tokenised card on file the gateway charges this without customer action.
-    await create_topup(state["app"].state.payments, session, wallet, pack, "card", None, None, automatic=True)
+    await create_topup(state["app"].state.payments, session, wallet, pack, "card", None, None, automatic=True,
+                       topup_id=uuid.uuid5(uuid.NAMESPACE_URL, f"auto-topup:{event.id}"))
 
 
 async def on_tenant_created(event: EventEnvelope, session) -> None:
